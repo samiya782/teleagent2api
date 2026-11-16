@@ -9,7 +9,8 @@
 | 平台 | 零配置 | 实测 |
 |---|---|---|
 | Linux / WSL | 可以。读取 `local-key` 与 `token.json` | `/health`、模型列表、流式对话、三个模型、工具调用及工具结果回传通过 |
-| Windows | 代码会查找本机登录文件并尝试 DPAPI | 在 Windows 进程内做过完整接口测试并通过；仓库里的独立 DPAPI 解密路径尚未复核成功，不能视为稳定零配置 |
+| Windows | 可以。`scheme=safe_storage` 用当前用户的 DPAPI 解开 `Local State` 里的 `os_crypt` 密钥，再解 `v10` 密文 | 用本机 Windows 登录态签名后，`user_info`、模型目录和 `chat-flash` 流式对话返回 HTTP 200 |
+| 网页 | 桌面 `token.json` 不存在或已过期时，读取 TeleAgent 与 Chrome / Edge 里的 `operationToken` 或 `x-token` | 桌面程序里的这枚 Cookie 与桌面 JWT 是同一枚。浏览器里过期的 Cookie 不会拿来签名 |
 
 `stream:false` 当前仍透传上游 SSE，不会聚合成单个 JSON。
 
@@ -35,9 +36,31 @@ Windows 自动搜索：
 ```text
 %USERPROFILE%\.local\share\TeleAgent\app-auth\device-meta.json
 %USERPROFILE%\.local\share\TeleAgent\users\*\app-auth\token.json
+%USERPROFILE%\.local\share\TeleAgent\Local State
+%APPDATA%\TeleAgent\app-auth\device-meta.json
 ```
 
-Windows 的 `scheme=safe_storage` 不使用 Linux 的 `local-key`。它必须由同一个 Windows 用户进程通过 DPAPI 解密。
+Windows 的 `scheme=safe_storage` 不使用 Linux 的 `local-key`。密文以 `v10` 开头，密钥放在同一用户目录的 `Local State`，并且只由这个 Windows 用户的 DPAPI 保护。在 Windows 上直接调用 `CryptUnprotectData`。从 WSL 启动时，如果当前系统没有可用的桌面登录态，会通过 `powershell.exe` 解开同一位 Windows 用户的登录态。
+
+网页端不另做登录。网关读取已经写在本机的 Cookie：
+
+```text
+TeleAgent/Partitions/*/Cookies
+TeleAgent/Network/Cookies
+Chrome、Edge 的 Network/Cookies
+```
+
+只用主机 `agent.teleai.com.cn` 上的 `operationToken` 或 `x-token`。桌面登录文件可用时优先用桌面 JWT。Cookie 过期时会跳过。
+
+## 令牌续期
+
+桌面 JWT 会过期。官方客户端在进程运行期间，每个本地日最多请求一次 `POST /cowork/auth/token-refresh`，成功后把新的 accessToken 写回 `token.json` 和同文件里的 `encryptedMeta`。会话还有一个大约 90 天的绝对期限，过了这个期限必须重新登录。
+
+网关使用同一条规则。启动时以及之后每 6 小时检查 `users/*/app-auth/renewal-schedule.json`。如果今天还没有尝试过，就续期并写回原来的 `token.json`。桌面客户端当天已经写过这个日期时，网关不再请求，避免把正在使用的令牌轮换掉。网页 Cookie 不会被续期，也不会被改写。显式传入 `-auth-state` 或 `TELEAGENT_SESSION_KEY` 时不碰桌面登录文件。
+
+```bash
+TELEAGENT_REFRESH=0 ./teleagent2api -addr 127.0.0.1:8787
+```
 
 可选的显式输入只用于调试：
 

@@ -17,25 +17,26 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 )
 
 const (
-	appVersion = "3.0.0-rc.1"
+	appVersion   = "3.0.0-rc.1"
 	upstreamHost = "https://agent.teleai.com.cn"
-	apiPrefix = "/superCowork/sapi"
-	chatPath = apiPrefix + "/api/v1/chat/completions"
-	authPrefix = "superagent-auth-v1"
+	apiPrefix    = "/superCowork/sapi"
+	chatPath     = apiPrefix + "/api/v1/chat/completions"
+	authPrefix   = "superagent-auth-v1"
 )
 
 type authState struct {
-	Token     string `json:"token"`
-	DeviceID  string `json:"deviceId"`
-	InstallID string `json:"installId"`
+	Token      string `json:"token"`
+	DeviceID   string `json:"deviceId"`
+	InstallID  string `json:"installId"`
+	OSType     string `json:"-"`
+	DeviceOS   string `json:"-"`
+	ClientType string `json:"-"`
 }
 
 type encryptedAuth struct {
@@ -73,16 +74,16 @@ type message struct {
 }
 
 type chatRequest struct {
-	Model               string          `json:"model"`
-	Messages            []message       `json:"messages"`
-	Stream              bool            `json:"stream,omitempty"`
-	MaxTokens           int             `json:"max_tokens,omitempty"`
-	Temperature         *float32        `json:"temperature,omitempty"`
-	Tools               json.RawMessage `json:"tools,omitempty"`
-	ToolChoice          json.RawMessage `json:"tool_choice,omitempty"`
-	ReasoningEffort     string          `json:"reasoning_effort,omitempty"`
-	ChatTemplateKwargs  json.RawMessage `json:"chat_template_kwargs,omitempty"`
-	StreamOptions       json.RawMessage `json:"stream_options,omitempty"`
+	Model              string          `json:"model"`
+	Messages           []message       `json:"messages"`
+	Stream             bool            `json:"stream,omitempty"`
+	MaxTokens          int             `json:"max_tokens,omitempty"`
+	Temperature        *float32        `json:"temperature,omitempty"`
+	Tools              json.RawMessage `json:"tools,omitempty"`
+	ToolChoice         json.RawMessage `json:"tool_choice,omitempty"`
+	ReasoningEffort    string          `json:"reasoning_effort,omitempty"`
+	ChatTemplateKwargs json.RawMessage `json:"chat_template_kwargs,omitempty"`
+	StreamOptions      json.RawMessage `json:"stream_options,omitempty"`
 }
 
 func main() {
@@ -106,6 +107,9 @@ func serve(addr, statePath, sessionKey string) error {
 	}
 	if _, err := loadState(statePath, sessionKey); err != nil {
 		return fmt.Errorf("logged-in TeleAgent auth state not found: %w", err)
+	}
+	if statePath == "" && sessionKey == "" && os.Getenv("TELEAGENT_AUTH_STATE_FILE") == "" && os.Getenv("TELEAGENT_SESSION_KEY") == "" {
+		startRenewal()
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
@@ -149,9 +153,22 @@ func serve(addr, statePath, sessionKey string) error {
 
 func loadState(path, sessionKey string) (authState, error) {
 	if path != "" || sessionKey != "" || os.Getenv("TELEAGENT_AUTH_STATE_FILE") != "" || os.Getenv("TELEAGENT_SESSION_KEY") != "" {
-		return loadEncryptedState(path, sessionKey)
+		state, err := loadEncryptedState(path, sessionKey)
+		if err != nil {
+			return authState{}, err
+		}
+		applyDesktopProfile(&state, "")
+		return state, nil
 	}
-	return loadDesktopState()
+	desktop, desktopErr := loadDesktopState()
+	if desktopErr == nil {
+		return desktop, nil
+	}
+	web, webErr := loadWebState()
+	if webErr == nil {
+		return web, nil
+	}
+	return authState{}, errors.Join(desktopErr, webErr)
 }
 
 func loadEncryptedState(path, sessionKey string) (authState, error) {
@@ -192,195 +209,9 @@ func loadEncryptedState(path, sessionKey string) (authState, error) {
 type ownerTokenFile struct {
 	Version        int    `json:"version"`
 	EncryptedToken string `json:"encryptedToken"`
+	Encrypted      bool   `json:"encrypted"`
 	Scheme         string `json:"scheme"`
-}
-
-func loadDesktopState() (authState, error) {
-	device, err := readDeviceMeta()
-	if err != nil {
-		return authState{}, err
-	}
-	matches, err := ownerTokenPaths()
-	if err != nil {
-		return authState{}, err
-	}
-	var last error
-	for _, tokenPath := range matches {
-		state, err := decryptOwnerToken(tokenPath, device)
-		if err == nil {
-			return state, nil
-		}
-		last = err
-	}
-	if last == nil {
-		last = errors.New("owner token not found")
-	}
-	return authState{}, last
-}
-
-func teleAgentRoots() ([]string, error) {
-	var homes []string
-	if runtime.GOOS == "windows" {
-		for _, key := range []string{"USERPROFILE", "HOME"} {
-			if value := strings.TrimSpace(os.Getenv(key)); value != "" {
-				homes = append(homes, value)
-			}
-		}
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		homes = append(homes, home)
-	}
-	if len(homes) == 0 {
-		return nil, errors.New("home directory not found")
-	}
-	seen := map[string]bool{}
-	var roots []string
-	for _, home := range homes {
-		root := filepath.Clean(filepath.Join(home, ".local", "share", "TeleAgent"))
-		if !seen[root] {
-			seen[root] = true
-			roots = append(roots, root)
-		}
-	}
-	return roots, nil
-}
-
-func ownerTokenPaths() ([]string, error) {
-	roots, err := teleAgentRoots()
-	if err != nil {
-		return nil, err
-	}
-	var matches []string
-	for _, root := range roots {
-		found, _ := filepath.Glob(filepath.Join(root, "users", "*", "app-auth", "token.json"))
-		matches = append(matches, found...)
-	}
-	return matches, nil
-}
-
-func readDeviceMeta() (authState, error) {
-	roots, err := teleAgentRoots()
-	if err != nil {
-		return authState{}, err
-	}
-	var last error
-	for _, root := range roots {
-		raw, err := os.ReadFile(filepath.Join(root, "app-auth", "device-meta.json"))
-		if err != nil {
-			last = err
-			continue
-		}
-		var state authState
-		if err := json.Unmarshal(raw, &state); err != nil {
-			return authState{}, err
-		}
-		if state.InstallID == "" {
-			return authState{}, errors.New("install id missing")
-		}
-		return state, nil
-	}
-	if last == nil {
-		last = errors.New("device metadata not found")
-	}
-	return authState{}, last
-}
-
-func decryptOwnerToken(tokenPath string, device authState) (authState, error) {
-	raw, err := os.ReadFile(tokenPath)
-	if err != nil {
-		return authState{}, err
-	}
-	var file ownerTokenFile
-	if err := json.Unmarshal(raw, &file); err != nil {
-		return authState{}, err
-	}
-	if file.Version != 1 || file.EncryptedToken == "" {
-		return authState{}, errors.New("unsupported owner token")
-	}
-	if file.Scheme == "safe_storage" {
-		if runtime.GOOS != "windows" {
-			return authState{}, errors.New("safe_storage token requires Windows DPAPI")
-		}
-		plain, err := decryptWindowsSafeStorage(file.EncryptedToken)
-		if err != nil {
-			return authState{}, err
-		}
-		device.Token = plain
-		if device.Token == "" {
-			return authState{}, errors.New("empty owner token")
-		}
-		return device, nil
-	}
-	if file.Scheme != "local" {
-		return authState{}, errors.New("unsupported owner token")
-	}
-	key, err := os.ReadFile(filepath.Join(filepath.Dir(tokenPath), "local-key"))
-	if err != nil {
-		return authState{}, err
-	}
-	if len(key) != 32 {
-		return authState{}, errors.New("invalid local key")
-	}
-	payload, err := base64.StdEncoding.DecodeString(file.EncryptedToken)
-	if err != nil {
-		return authState{}, err
-	}
-	if len(payload) <= 28 {
-		return authState{}, errors.New("truncated owner token")
-	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return authState{}, err
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return authState{}, err
-	}
-	plain, err := gcm.Open(nil, payload[:12], append(payload[28:], payload[12:28]...), nil)
-	if err != nil {
-		return authState{}, err
-	}
-	device.Token = string(plain)
-	if device.Token == "" {
-		return authState{}, errors.New("empty owner token")
-	}
-	return device, nil
-}
-
-
-func decryptWindowsSafeStorage(encoded string) (string, error) {
-	script := `$ErrorActionPreference='Stop'; Add-Type -TypeDefinition @"
-using System;
-using System.Linq;
-using System.Runtime.InteropServices;
-using System.Text;
-public static class TeleAgentDpapi {
-  [StructLayout(LayoutKind.Sequential)] struct Blob { public int cb; public IntPtr pb; }
-  [DllImport("crypt32.dll", SetLastError=true)] static extern bool CryptUnprotectData(ref Blob inb, IntPtr desc, IntPtr ent, IntPtr res, IntPtr prompt, int flags, out Blob outb);
-  public static string Open(string b64) {
-    byte[] data = Convert.FromBase64String(b64);
-    if (data.Length > 5 && data[0]==118 && data[1]==49 && data[2]==48) data = data.Skip(5).ToArray();
-    Blob input = new Blob { cb = data.Length, pb = Marshal.AllocHGlobal(data.Length) };
-    Marshal.Copy(data, 0, input.pb, data.Length);
-    Blob output;
-    try {
-      if (!CryptUnprotectData(ref input, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0, out output)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-    } finally { Marshal.FreeHGlobal(input.pb); }
-    try {
-      byte[] plain = new byte[output.cb];
-      Marshal.Copy(output.pb, plain, 0, output.cb);
-      return Encoding.UTF8.GetString(plain);
-    } finally { if (output.pb != IntPtr.Zero) Marshal.FreeHGlobal(output.pb); }
-  }
-}
-"@; [TeleAgentDpapi]::Open([Console]::In.ReadToEnd().Trim())`
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
-	cmd.Stdin = strings.NewReader(encoded)
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("Windows safe storage decryption failed: %w", err)
-	}
-	return strings.TrimSpace(string(out)), nil
+	EncryptedMeta  string `json:"encryptedMeta,omitempty"`
 }
 
 func decrypt(enc encryptedAuth, sessionKey string) ([]byte, error) {
@@ -539,9 +370,16 @@ func signedRequest(r *http.Request, state authState, method, path string, body [
 	}
 	req.Header.Set("X-Timestamp", headers["X-SuperAgent-Timestamp"])
 	req.Header.Set("X-Nonce", headers["X-SuperAgent-Nonce"])
-	req.Header.Set("X-OS-Type", "Linux")
-	req.Header.Set("X-Device-Os", "linux")
-	req.Header.Set("X-Teleai-Client-Type", "desktop")
+	osType, deviceOS, client := state.OSType, state.DeviceOS, state.ClientType
+	if osType == "" {
+		osType, deviceOS, client = "Linux", "linux", "desktop"
+		if runtime.GOOS == "windows" {
+			osType, deviceOS, client = "Windows", "windows", "desktop"
+		}
+	}
+	req.Header.Set("X-OS-Type", osType)
+	req.Header.Set("X-Device-Os", deviceOS)
+	req.Header.Set("X-Teleai-Client-Type", client)
 	return http.DefaultClient.Do(req)
 }
 
@@ -552,12 +390,12 @@ func sign(state authState, method, uri string, body []byte, timestamp, nonce, ve
 		authPrefix, strings.ToUpper(method), uri, timestamp, nonce, version, bodyHash,
 	}, "\n"))
 	headers := map[string]string{
-		"X-Token":                    state.Token,
-		"X-SuperAgent-Timestamp":     timestamp,
-		"X-SuperAgent-Nonce":         nonce,
-		"X-SuperAgent-Sign-Version":  "v1",
-		"X-SuperAgent-Signature":     signature,
-		"X-App-Version":              version,
+		"X-Token":                   state.Token,
+		"X-SuperAgent-Timestamp":    timestamp,
+		"X-SuperAgent-Nonce":        nonce,
+		"X-SuperAgent-Sign-Version": "v1",
+		"X-SuperAgent-Signature":    signature,
+		"X-App-Version":             version,
 	}
 	if state.DeviceID != "" {
 		headers["X-SuperAgent-Device-Id"] = state.DeviceID
@@ -601,10 +439,10 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 type sseScanner struct {
-	r   io.Reader
-	buf []byte
+	r    io.Reader
+	buf  []byte
 	line string
-	err error
+	err  error
 }
 
 func newSSEScanner(r io.Reader) *sseScanner { return &sseScanner{r: r, buf: make([]byte, 0, 4096)} }

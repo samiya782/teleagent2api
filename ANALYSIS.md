@@ -22,7 +22,7 @@ https://agent.teleai.com.cn/teleagent
 
 `code` 只是成功标志，真正使用的是 `token`。桌面程序随后把它保存为本机加密状态，不写进普通日志。
 
-因此网关不做浏览器回跳粘贴，也不实现短信登录。它要求 TeleAgent 已经在当前平台完成登录。
+因此网关不做浏览器回跳粘贴，也不实现短信登录。它要求 TeleAgent 已经在当前平台完成登录：桌面版读本机 `token.json`，网页版读已经落在本机的 `operationToken` Cookie。
 
 ## 2. 身份校验与模型目录
 
@@ -192,7 +192,11 @@ Accept: text/event-stream
 
 Linux 的 token 文件使用 `scheme=local`。同目录 `local-key` 提供 32 字节 AES 密钥，密文是 AES-256-GCM。前 12 字节是 nonce，随后 16 字节是 tag，剩余部分是 ciphertext。
 
-Windows 文件使用 `scheme=safe_storage`。客户端通过 Electron `safeStorage` 调用当前用户的 DPAPI，不存在可直接复用的 `local-key`。因此 Windows 零配置必须在该 Windows 用户自己的进程里完成，不能从 WSL 或另一台机器解密。
+Windows 文件使用 `scheme=safe_storage`。Electron `safeStorage.encryptString` 的结果再做标准 Base64。解码后以 `v10` 开头，后面是 12 字节 nonce 和 AES-256-GCM 密文（末尾 16 字节是 tag）。AES 密钥不在 `token.json` 里，而在同一用户目录的 `Local State`：`os_crypt.encrypted_key` 先做 Base64，去掉 `DPAPI` 前缀后由当前 Windows 用户的 DPAPI 解开，得到 32 字节密钥。因此 Windows 零配置必须由该 Windows 用户自己的进程完成。WSL 可以调用这个用户的 `powershell.exe` 做同一次 DPAPI，不能把 `Local State` 拷到另一台机器解开。
+
+网页版把同一类 JWT 放在 `agent.teleai.com.cn` 的 Cookie `operationToken`，同值还有 `x-token`。桌面程序的分区 Cookie 库里，这枚 Cookie 与 `token.json` 解开后的桌面 JWT 相同。网关在桌面登录文件缺失或过期时才读取它，并继续用本机 `device-meta.json` 的 `installId` 签名。过期 Cookie 直接跳过。
+
+桌面客户端用空 body 调用 `POST /cowork/auth/token-refresh`。请求头是 `X-Token`、`X-Timestamp`、`X-Nonce`、`X-App-Version`、`X-OS-Type` 和 `X-SuperAgent-Device-Id`。成功响应给出 `accessToken`、`expiresIn` 和 `absoluteExpiresAt`。这个调用会轮换服务端会话，旧令牌在宽限之后失效，所以新令牌必须写回 `token.json`，同时更新 `encryptedMeta`（里面包含同一枚 token、签发时间、到期时间和递增的 `generation`）。客户端每个本地日只尝试一次，日期记在 `renewal-schedule.json`。业务码 `40116` 表示大约 90 天的绝对期限已到，续期不能再延长。网关沿用这个日程；若官方头返回 HTTP 401，再用对话接口同一套签名重试一次。
 
 `auth.json` 保存的是模型 provider 配置，不是这三个登录字段。
 
@@ -207,10 +211,10 @@ Linux 网关 `127.0.0.1:8787`：
 - 回传工具结果后，回复包含 `18` 和 `cloudy`。
 - 空请求返回 HTTP 400。
 
-Windows 在本机 Windows 进程内使用 DPAPI 做了同样的接口测试，结果相同。随后把 DPAPI 调用放进仓库的独立 PowerShell 路径时解密失败，所以文档不把它记为已经稳定的 Windows 零配置实现。
+Windows 登录态用 `v10` 和 `Local State` 的 DPAPI 密钥解开后，`user_info` 业务码 200，模型目录业务码 0，`chat-flash` 流式对话返回 HTTP 200、SSE、`pong` 和 `[DONE]`。请求头里的系统标记是 `Windows` / `windows` / `desktop`。
 
 ## 9. 仍有的限制
 
 - `stream:false` 没有在网关内聚合成 JSON。
-- Windows 独立进程的 DPAPI 解密还需在 Windows 上继续复核。
+- 网页 Cookie 只有在它仍是未过期的桌面 JWT 时才能签名。纯浏览器会话如果没有本机 `device-meta.json`，签名里的 Install ID 为空。
 - 官方客户端版本升级后，签名字段顺序和登录文件格式都需要重新验证。
