@@ -161,7 +161,7 @@ func proxyCompatible(w http.ResponseWriter, r *http.Request, state authState, re
 }
 
 type compatibleOutput struct {
-	customTools               map[string]bool
+	responseTools             map[string]responseTool
 	w                         http.ResponseWriter
 	format                    apiFormat
 	model, id, messageID      string
@@ -176,7 +176,7 @@ func newOutput(w http.ResponseWriter, format apiFormat, req chatRequest) *compat
 		prefix = "msg_"
 	}
 	return &compatibleOutput{
-		w: w, format: format, model: req.Model, stream: req.Stream, customTools: req.CustomTools,
+		w: w, format: format, model: req.Model, stream: req.Stream, responseTools: req.responseTools,
 		id: prefix + newNonce(), messageID: "msg_" + newNonce(), created: time.Now().Unix(),
 	}
 }
@@ -330,7 +330,11 @@ func (o *compatibleOutput) finishResponses(c *completion) {
 		index := len(output)
 		id, kind := "fc_"+newNonce(), "function_call"
 		value, field, event := call.Function.Arguments, "arguments", "response.function_call_arguments"
-		if o.customTools[call.Function.Name] {
+		tool, known := o.responseTools[call.Function.Name]
+		if !known {
+			tool.name = call.Function.Name
+		}
+		if tool.custom {
 			var args struct{ Input *string }
 			if json.Unmarshal([]byte(value), &args) != nil || args.Input == nil {
 				const detail = "upstream returned invalid custom tool input"
@@ -345,14 +349,22 @@ func (o *compatibleOutput) finishResponses(c *completion) {
 			value, field, event = *args.Input, "input", "response.custom_tool_call_input"
 		}
 		item := func(value, status string) fields {
-			return fields{"type": kind, "id": id, "call_id": call.ID, "name": call.Function.Name, field: value, "status": status}
+			item := fields{"type": kind, "id": id, "call_id": call.ID, "name": tool.name, field: value, "status": status}
+			if tool.namespace != "" {
+				item["namespace"] = tool.namespace
+			}
+			return item
 		}
 		done := item(value, status)
 		output = append(output, done)
 		if o.stream {
 			o.event("response.output_item.added", fields{"output_index": index, "item": item("", "in_progress")})
 			o.event(event+".delta", fields{"output_index": index, "item_id": id, "delta": value})
-			o.event(event+".done", fields{"output_index": index, "item_id": id, "name": call.Function.Name, field: value})
+			eventDone := fields{"output_index": index, "item_id": id, "name": tool.name, field: value}
+			if tool.namespace != "" {
+				eventDone["namespace"] = tool.namespace
+			}
+			o.event(event+".done", eventDone)
 			o.event("response.output_item.done", fields{"output_index": index, "item": done})
 		}
 	}

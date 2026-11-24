@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -77,13 +78,42 @@ func TestReadCookieTokens(t *testing.T) {
 	if _, err := db.Exec(`insert into cookies values (?, ?, ?, ?)`, "agent.teleai.com.cn", "operationToken", "ab:"+token, []byte{}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.Exec(`insert into cookies values (?, ?, ?, ?)`, ".agent.teleai.com.cn", "x-token", "", []byte("v20fixture")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`insert into cookies values (?, ?, ?, ?)`, "unrelatedteleai.com.cn", "x-token", token, []byte{}); err != nil {
+		t.Fatal(err)
+	}
 	db.Close()
 	got, err := readCookieTokens(cookieDB{path: dbPath})
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, errAppBoundCookie) {
+		t.Fatalf("missing App-Bound Encryption diagnosis: %v", err)
 	}
 	if len(got) != 1 || got[0] != token {
 		t.Fatalf("cookie token mismatch")
+	}
+}
+
+func TestLoadExplicitWebToken(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	t.Setenv(webTokenFileEnv, path)
+	t.Setenv("TELEAGENT_AUTH_STATE_FILE", "")
+	t.Setenv("TELEAGENT_SESSION_KEY", "")
+	token := testJWT(t, time.Now().Add(time.Hour).Unix())
+	if err := os.WriteFile(path, []byte("\ufeff"+token+"\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state, err := loadState("", "")
+	if err != nil || state.Token != token || state.OSType != "Web" || state.ClientType != "web" {
+		t.Fatalf("web token state was not loaded: %v", err)
+	}
+	for _, raw := range []string{"malformed", testJWT(t, time.Now().Add(-time.Hour).Unix()), strings.Repeat("x", (16<<10)+1)} {
+		if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadState("", ""); err == nil || strings.Contains(err.Error(), raw) {
+			t.Fatal("invalid file accepted or its contents exposed")
+		}
 	}
 }
 

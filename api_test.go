@@ -113,3 +113,72 @@ func TestTruncatedCompletion(t *testing.T) {
 		t.Fatal("truncated upstream stream reported success")
 	}
 }
+
+func TestResponsesNamespacedToolRoundTrip(t *testing.T) {
+	const namespace = "mcp__a_very_long_namespace_with_punctuation.example"
+	const input = `{"model":"chat-pro","input":"read the fixture","tools":[
+		{"type":"function","name":"read_fixture"},
+		{"type":"namespace","name":"mcp__other","tools":[{"type":"function","name":"read_fixture"}]},
+		{"type":"namespace","name":"mcp__a_very_long_namespace_with_punctuation.example","tools":[
+			{"type":"function","name":"read_fixture","parameters":{"type":"object"}}
+		]}
+	],"tool_choice":{"type":"function","namespace":"mcp__a_very_long_namespace_with_punctuation.example","name":"read_fixture"}}`
+	req, err := parseAPIRequest([]byte(input), responsesAPI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tools []struct{ Function struct{ Name string } }
+	if err := json.Unmarshal(req.Tools, &tools); err != nil || len(tools) != 3 {
+		t.Fatalf("tools were dropped: %s (%v)", req.Tools, err)
+	}
+	plain, other, namespaced := tools[0].Function.Name, tools[1].Function.Name, tools[2].Function.Name
+	if plain != "read_fixture" || namespaced == plain || namespaced == other || len(namespaced) > 64 ||
+		toolNameCharacters.MatchString(namespaced) || !strings.Contains(string(req.ToolChoice), namespaced) {
+		t.Fatalf("tool names or choice incorrectly converted: %s %s", req.Tools, req.ToolChoice)
+	}
+
+	result := &completion{finish: "tool_calls", tools: []toolCall{makeCall("call_1", namespaced, `{}`)}}
+	w := httptest.NewRecorder()
+	newOutput(w, responsesAPI, req).finish(result)
+	var response struct{ Output []wireItem }
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil || len(response.Output) != 1 {
+		t.Fatalf("invalid tool response: %s", w.Body)
+	}
+	call := response.Output[0]
+	if call.Name != "read_fixture" || call.Namespace != namespace || call.CallID != "call_1" {
+		t.Fatalf("tool identity lost: %+v", call)
+	}
+
+	// Replay can omit a tool definition after that tool has been called.
+	replay := fields{"model": "chat-pro", "input": []any{
+		fields{"type": "function_call", "namespace": call.Namespace, "name": call.Name, "call_id": call.CallID, "arguments": call.Arguments},
+		fields{"type": "function_call_output", "call_id": call.CallID, "output": "fixture"},
+	}}
+	req, err = parseAPIRequest(rawJSON(replay), responsesAPI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(req.Messages) != 2 || req.Messages[0].ToolCalls[0].Function.Name != namespaced || req.Messages[1].ToolCallID != call.CallID {
+		t.Fatalf("unexpected replay history: %+v", req.Messages)
+	}
+}
+
+func TestResponsesNamespacedCustomToolStream(t *testing.T) {
+	req, err := parseAPIRequest([]byte(`{"model":"chat-pro","stream":true,"input":"read","tools":[
+		{"type":"namespace","name":"local","tools":[{"type":"custom","name":"read"}]}
+	]}`), responsesAPI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	newOutput(w, responsesAPI, req).finish(&completion{
+		finish: "tool_calls",
+		tools:  []toolCall{makeCall("call_2", upstreamToolName("local", "read"), `{"input":"fixture"}`)},
+	})
+	for _, want := range []string{`"type":"custom_tool_call"`, `"name":"read"`, `"namespace":"local"`,
+		`"input":"fixture"`, "event: response.custom_tool_call_input.done", "event: response.completed"} {
+		if !strings.Contains(w.Body.String(), want) {
+			t.Fatalf("stream missing %s: %s", want, w.Body)
+		}
+	}
+}

@@ -48,13 +48,28 @@ TeleAgent/Network/Cookies
 Chrome、Edge 的 Network/Cookies
 ```
 
-只用主机 `agent.teleai.com.cn` 上的 `operationToken` 或 `x-token`。桌面登录文件可用时优先用桌面 JWT。Cookie 过期时会跳过。
+仅检查 `agent.teleai.com.cn` 及其父域 `teleai.com.cn` 上的 `operationToken` 或 `x-token`。自动读取时优先用桌面登录态，并跳过过期的 Cookie。
+
+遇到浏览器 App-Bound Encryption（`v20`）时，可以直接使用已登录的 TeleAgent 桌面客户端。如果手头有通过授权获得的 TeleAgent 网页会话 JWT，也可通过 `TELEAGENT_WEB_TOKEN_FILE` 显式指定一个只含该 JWT、仅当前用户可读的本地文件。网关每次请求读取这个文件，因此换发令牌后可更新文件。[Chrome App-Bound Encryption](https://security.googleblog.com/2024/07/improving-security-of-chrome-cookies-on.html)
+
+Linux / WSL：
+
+```bash
+TELEAGENT_WEB_TOKEN_FILE=/path/to/private-token-file ./teleagent2api
+```
+
+Windows PowerShell：
+
+```powershell
+$env:TELEAGENT_WEB_TOKEN_FILE = 'C:\path\to\private-token-file'
+.\teleagent2api.exe
+```
 
 ## 令牌续期
 
 桌面 JWT 会过期。官方客户端在进程运行期间，每个本地日最多请求一次 `POST /cowork/auth/token-refresh`，成功后把新的 accessToken 写回 `token.json` 和同文件里的 `encryptedMeta`。会话还有一个大约 90 天的绝对期限，过了这个期限必须重新登录。
 
-网关使用同一条规则。启动时以及之后每 6 小时检查 `users/*/app-auth/renewal-schedule.json`。如果今天还没有尝试过，就续期并写回原来的 `token.json`。桌面客户端当天已经写过这个日期时，网关不再请求，避免把正在使用的令牌轮换掉。网页 Cookie 不会被续期，也不会被改写。显式传入 `-auth-state` 或 `TELEAGENT_SESSION_KEY` 时不碰桌面登录文件。
+网关使用同一条规则。启动时以及之后每 6 小时检查 `users/*/app-auth/renewal-schedule.json`。如果今天还没有尝试过，就续期并写回原来的 `token.json`。桌面客户端当天已经写过这个日期时，网关不再请求，避免把正在使用的令牌轮换掉。网页 Cookie 不会被续期，也不会被改写。显式指定调试登录态或 `TELEAGENT_WEB_TOKEN_FILE` 时会关闭桌面续期。令牌和续期日期使用同目录临时文件替换，替换失败时保留原文件。
 
 ```bash
 TELEAGENT_REFRESH=0 ./teleagent2api -addr 127.0.0.1:8787
@@ -91,7 +106,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 支持 `messages`、文本数组、`tools`、`tool_choice`、`tool_calls` 和工具结果回传。`chat-pro` 实测不支持温度、推理和附件，但支持工具调用。可用模型为 `chat-pro`、`chat-flagship`、`chat-flash`。
 
-三种对话入口均支持 JSON 和 SSE 响应，以及客户端工具定义、调用参数和结果回传。Responses 请求需在 `input` 中带上本轮所需的完整历史。令牌估算用于 Claude Code 的上下文管理，实际用量来自上游。
+三种对话入口均支持 JSON 和 SSE 响应，以及客户端工具定义、调用参数和结果回传。Responses 支持 Codex 的命名空间 MCP 函数，客户端负责执行工具，并在下一次请求的 `input` 中发回完整历史和工具结果。令牌估算用于 Claude Code 的上下文管理，实际用量来自上游。
 
 ## Claude Code
 

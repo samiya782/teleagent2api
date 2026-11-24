@@ -75,7 +75,7 @@ type message struct {
 }
 
 type chatRequest struct {
-	CustomTools        map[string]bool `json:"-"`
+	responseTools      map[string]responseTool
 	Model              string          `json:"model"`
 	Messages           []message       `json:"messages"`
 	Stream             bool            `json:"stream,omitempty"`
@@ -110,7 +110,7 @@ func serve(addr, statePath, sessionKey string) error {
 	if _, err := loadState(statePath, sessionKey); err != nil {
 		return fmt.Errorf("logged-in TeleAgent auth state not found: %w", err)
 	}
-	if statePath == "" && sessionKey == "" && os.Getenv("TELEAGENT_AUTH_STATE_FILE") == "" && os.Getenv("TELEAGENT_SESSION_KEY") == "" {
+	if statePath == "" && sessionKey == "" && os.Getenv("TELEAGENT_AUTH_STATE_FILE") == "" && os.Getenv("TELEAGENT_SESSION_KEY") == "" && os.Getenv(webTokenFileEnv) == "" {
 		startRenewal()
 	}
 	mux := http.NewServeMux()
@@ -131,6 +131,9 @@ func loadState(path, sessionKey string) (authState, error) {
 		}
 		applyDesktopProfile(&state, "")
 		return state, nil
+	}
+	if webTokenPath := os.Getenv(webTokenFileEnv); webTokenPath != "" {
+		return loadWebTokenFile(webTokenPath)
 	}
 	desktop, desktopErr := loadDesktopState()
 	if desktopErr == nil {

@@ -185,3 +185,22 @@ func readBody(r *http.Request) (string, error) {
 	_, err := buf.ReadFrom(r.Body)
 	return buf.String(), err
 }
+
+func TestAuthFileReplacementPreservesDestinationOnFailure(t *testing.T) {
+	parent := t.TempDir()
+	path := filepath.Join(parent, "token.json")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeOwnerTokenFile(path, ownerTokenFile{Version: 1}); err == nil {
+		t.Fatal("expected replacement to fail when destination is a directory")
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("existing destination was changed: %v", err)
+	}
+	children, err := os.ReadDir(parent)
+	if err != nil || len(children) != 1 {
+		t.Fatalf("temporary file left after failed replacement: %v (%v)", children, err)
+	}
+}

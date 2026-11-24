@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 )
 
@@ -172,18 +174,19 @@ func rawJSON(v any) json.RawMessage {
 }
 
 type wireItem struct {
-	Type, Role, Name, Text, Arguments string
-	ID                                string `json:"id"`
-	CallID                            string `json:"call_id"`
-	ToolUseID                         string `json:"tool_use_id"`
-	URL                               string `json:"image_url"`
-	Content, Input, Output, Source    json.RawMessage
+	Type, Role, Name, Text, Arguments, Namespace string
+	ID                                           string `json:"id"`
+	CallID                                       string `json:"call_id"`
+	ToolUseID                                    string `json:"tool_use_id"`
+	URL                                          string `json:"image_url"`
+	Content, Input, Output, Source               json.RawMessage
 }
 
 type wireTool struct {
-	Type, Name, Description string
-	Parameters              json.RawMessage
-	InputSchema             json.RawMessage `json:"input_schema"`
+	Type, Name, Description, Namespace string
+	Tools                              []wireTool
+	Parameters                         json.RawMessage
+	InputSchema                        json.RawMessage `json:"input_schema"`
 }
 
 func makeCall(id, name, arguments string) toolCall {
@@ -265,21 +268,63 @@ func parseAPIRequest(body []byte, format apiFormat) (chatRequest, error) {
 	if len(req.Messages) == 0 {
 		return req, fmt.Errorf("messages must contain text, images, or tool data")
 	}
-	req.Tools, req.ToolChoice, req.CustomTools = convertTools(wire.Tools, wire.ToolChoice)
-	return req, nil
+	var err error
+	req.Tools, req.ToolChoice, req.responseTools, err = convertTools(wire.Tools, wire.ToolChoice)
+	return req, err
 }
 
-func convertTools(input []wireTool, rawChoice json.RawMessage) (json.RawMessage, json.RawMessage, map[string]bool) {
-	var tools []fields
-	custom := make(map[string]bool)
+type responseTool struct {
+	name, namespace string
+	custom          bool
+}
+
+var toolNameCharacters = regexp.MustCompile(`[^A-Za-z0-9_-]+`)
+
+func upstreamToolName(namespace, name string) string {
+	if namespace == "" {
+		return name
+	}
+	// Chat Completions accepts at most 64 characters from [A-Za-z0-9_-].
+	// Use a stable hash of the original pair so history maps to the same name.
+	label := toolNameCharacters.ReplaceAllString(namespace+"_"+name, "_")
+	if len(label) > 36 {
+		label = label[:36]
+	}
+	digest := hex.EncodeToString(sum256(rawJSON([2]string{namespace, name}))[:12])
+	return "ns_" + label + "_" + digest
+}
+
+func convertTools(input []wireTool, rawChoice json.RawMessage) (json.RawMessage, json.RawMessage, map[string]responseTool, error) {
+	var flat []wireTool
 	for _, tool := range input {
+		if tool.Type != "namespace" {
+			flat = append(flat, tool)
+			continue
+		}
+		if tool.Name == "" {
+			return nil, nil, nil, fmt.Errorf("tool namespace name is required")
+		}
+		for _, child := range tool.Tools {
+			child.Namespace = tool.Name
+			flat = append(flat, child)
+		}
+	}
+
+	var tools []fields
+	identities := make(map[string]responseTool)
+	for _, tool := range flat {
 		// Client-hosted function tools are executed by the client.
 		if tool.Name == "" || (tool.Type != "" && tool.Type != "function" && tool.Type != "custom" && !strings.HasPrefix(tool.Type, "custom_")) {
 			continue
 		}
+		name := upstreamToolName(tool.Namespace, tool.Name)
+		identity := responseTool{name: tool.Name, namespace: tool.Namespace, custom: tool.Type == "custom"}
+		if previous, exists := identities[name]; exists && previous != identity {
+			return nil, nil, nil, fmt.Errorf("tool name collision for %q", tool.Name)
+		}
+		identities[name] = identity
 		schema := tool.Parameters
-		if tool.Type == "custom" {
-			custom[tool.Name] = true
+		if identity.custom {
 			schema = rawJSON(fields{
 				"type": "object", "required": []string{"input"},
 				"properties": fields{"input": fields{"type": "string", "description": "Raw input for the tool"}},
@@ -292,21 +337,22 @@ func convertTools(input []wireTool, rawChoice json.RawMessage) (json.RawMessage,
 			schema = rawJSON(fields{"type": "object", "properties": fields{}})
 		}
 		tools = append(tools, fields{"type": "function", "function": fields{
-			"name": tool.Name, "description": tool.Description, "parameters": schema,
+			"name": name, "description": tool.Description, "parameters": schema,
 		}})
 	}
 	if len(tools) == 0 {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	var choice string
 	if json.Unmarshal(rawChoice, &choice) == nil && choice != "" {
-		return rawJSON(tools), rawChoice, custom
+		return rawJSON(tools), rawChoice, identities, nil
 	}
 	var object wireTool
 	_ = json.Unmarshal(rawChoice, &object)
 	switch object.Type {
 	case "tool", "function", "custom":
-		return rawJSON(tools), rawJSON(fields{"type": "function", "function": fields{"name": object.Name}}), custom
+		name := upstreamToolName(object.Namespace, object.Name)
+		return rawJSON(tools), rawJSON(fields{"type": "function", "function": fields{"name": name}}), identities, nil
 	case "any", "required":
 		choice = "required"
 	case "none":
@@ -314,7 +360,7 @@ func convertTools(input []wireTool, rawChoice json.RawMessage) (json.RawMessage,
 	default:
 		choice = "auto"
 	}
-	return rawJSON(tools), rawJSON(choice), custom
+	return rawJSON(tools), rawJSON(choice), identities, nil
 }
 
 func appendWireMessage(req *chatRequest, role string, raw json.RawMessage) error {
@@ -429,7 +475,7 @@ func appendResponsesInput(req *chatRequest, raw json.RawMessage) error {
 				req.Messages = append(req.Messages, message{Role: "assistant"})
 				n++
 			}
-			req.Messages[n-1].ToolCalls = append(req.Messages[n-1].ToolCalls, makeCall(item.CallID, item.Name, args))
+			req.Messages[n-1].ToolCalls = append(req.Messages[n-1].ToolCalls, makeCall(item.CallID, upstreamToolName(item.Namespace, item.Name), args))
 		case "function_call_output", "custom_tool_call_output":
 			result, err := toolOutput(item.Output)
 			if err != nil {

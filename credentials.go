@@ -109,24 +109,50 @@ func containsPath(paths []string, want string) bool {
 	return false
 }
 
+const webTokenFileEnv = "TELEAGENT_WEB_TOKEN_FILE"
+
+var errAppBoundCookie = errors.New("browser cookie uses App-Bound Encryption (v20); use a signed-in TeleAgent desktop app or set TELEAGENT_WEB_TOKEN_FILE")
+
 func loadWebState() (authState, error) {
-	tokens, err := webSessionTokens()
-	if err != nil {
-		return authState{}, err
-	}
+	tokens, cookieErr := webSessionTokens()
 	token, err := pickSessionToken(tokens)
 	if err != nil {
-		return authState{}, err
+		return authState{}, errors.Join(err, cookieErr)
 	}
-	device, err := readDeviceMeta()
+	return webState(token), nil
+}
+
+func loadWebTokenFile(path string) (authState, error) {
+	file, err := os.Open(path)
 	if err != nil {
-		device = authState{}
+		return authState{}, fmt.Errorf("open web token file: %w", err)
 	}
+	defer file.Close()
+	const maxTokenSize = 16 << 10
+	raw, err := io.ReadAll(io.LimitReader(file, maxTokenSize+1))
+	if err != nil {
+		return authState{}, fmt.Errorf("read web token file: %w", err)
+	}
+	if len(raw) > maxTokenSize {
+		return authState{}, errors.New("web token file exceeds 16 KiB")
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(string(raw), "\ufeff"))
+	if _, ok := jwtExpiry(token); !ok || normalizeSessionToken(token) != token {
+		return authState{}, errors.New("web token file must contain one TeleAgent JWT with an expiration")
+	}
+	if jwtExpired(token) {
+		return authState{}, errors.New("web token file has expired")
+	}
+	return webState(token), nil
+}
+
+func webState(token string) authState {
+	device, _ := readDeviceMeta()
 	device.Token = token
 	device.OSType = "Web"
 	device.DeviceOS = "web"
 	device.ClientType = "web"
-	return device, nil
+	return device
 }
 
 func teleAgentRoots() ([]string, error) {
@@ -449,29 +475,25 @@ func writeOwnerTokenFile(path string, file ownerTokenFile) error {
 	if err != nil {
 		return err
 	}
-	raw = append(raw, '\n')
-	tmp := fmt.Sprintf("%s.%d.tmp", path, os.Getpid())
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	return replaceAuthFile(path, append(raw, '\n'))
+}
+
+func replaceAuthFile(path string, raw []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*.tmp")
 	if err != nil {
 		return err
 	}
-	_, writeErr := f.Write(raw)
-	syncErr := f.Sync()
-	closeErr := f.Close()
-	if writeErr != nil || syncErr != nil || closeErr != nil {
-		os.Remove(tmp)
-		return errors.Join(writeErr, syncErr, closeErr)
+	defer os.Remove(f.Name())
+
+	_, err = f.Write(raw)
+	if err == nil {
+		err = f.Sync()
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		if rmErr := os.Remove(path); rmErr == nil {
-			if err2 := os.Rename(tmp, path); err2 == nil {
-				return nil
-			}
-		}
-		os.Remove(tmp)
+	if err := errors.Join(err, f.Close()); err != nil {
 		return err
 	}
-	return nil
+	// Rename replaces the destination in one operation. If it fails, leave the existing file in place.
+	return os.Rename(f.Name(), path)
 }
 
 func renewalSchedulePath(tokenPath string) string {
@@ -499,22 +521,7 @@ func writeRenewalDay(tokenPath, day string) error {
 	if err != nil {
 		return err
 	}
-	raw = append(raw, '\n')
-	path := renewalSchedulePath(tokenPath)
-	tmp := fmt.Sprintf("%s.%d.tmp", path, os.Getpid())
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		if rmErr := os.Remove(path); rmErr == nil {
-			if err2 := os.Rename(tmp, path); err2 == nil {
-				return nil
-			}
-		}
-		os.Remove(tmp)
-		return err
-	}
-	return nil
+	return replaceAuthFile(renewalSchedulePath(tokenPath), append(raw, '\n'))
 }
 
 func acquireRenewLock(tokenPath string) (func(), error) {
@@ -641,16 +648,13 @@ func webSessionTokens() ([]string, error) {
 	var last error
 	for _, db := range cookieDatabases() {
 		found, err := readCookieTokens(db)
-		if err != nil {
-			last = err
-			continue
-		}
 		tokens = append(tokens, found...)
+		// Keep an App-Bound error visible even when other profiles are absent.
+		if err != nil && !os.IsNotExist(err) && !errors.Is(last, errAppBoundCookie) {
+			last = err
+		}
 	}
-	if len(tokens) == 0 && last != nil {
-		return nil, last
-	}
-	return tokens, nil
+	return tokens, last
 }
 
 func cookieDatabases() []cookieDB {
@@ -739,13 +743,14 @@ func readCookieTokens(db cookieDB) ([]string, error) {
 		return nil, err
 	}
 	defer conn.Close()
-	rows, err := conn.Query(`select value, encrypted_value from cookies where name in ('operationToken', 'x-token') and host_key like '%teleai.com.cn'`)
+	rows, err := conn.Query(`select value, encrypted_value from cookies where name in ('operationToken', 'x-token') and host_key in ('agent.teleai.com.cn', '.agent.teleai.com.cn', 'teleai.com.cn', '.teleai.com.cn')`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var key []byte
 	var tokens []string
+	appBound := false
 	for rows.Next() {
 		var value string
 		var encrypted []byte
@@ -756,7 +761,11 @@ func readCookieTokens(db cookieDB) ([]string, error) {
 			tokens = append(tokens, token)
 			continue
 		}
-		if len(encrypted) == 0 || !bytes.HasPrefix(encrypted, []byte("v10")) {
+		if bytes.HasPrefix(encrypted, []byte("v20")) {
+			appBound = true
+			continue
+		}
+		if !bytes.HasPrefix(encrypted, []byte("v10")) {
 			continue
 		}
 		if key == nil {
@@ -773,7 +782,11 @@ func readCookieTokens(db cookieDB) ([]string, error) {
 			tokens = append(tokens, token)
 		}
 	}
-	return tokens, rows.Err()
+	err = rows.Err()
+	if appBound {
+		err = errors.Join(err, errAppBoundCookie)
+	}
+	return tokens, err
 }
 
 func copyFile(src, dst string) error {
