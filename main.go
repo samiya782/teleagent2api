@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
@@ -74,6 +75,7 @@ type message struct {
 }
 
 type chatRequest struct {
+	CustomTools        map[string]bool `json:"-"`
 	Model              string          `json:"model"`
 	Messages           []message       `json:"messages"`
 	Stream             bool            `json:"stream,omitempty"`
@@ -115,37 +117,7 @@ func serve(addr, statePath, sessionKey string) error {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
-		state, err := loadState(statePath, sessionKey)
-		if err != nil {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "auth state unavailable"})
-			return
-		}
-		proxyJSON(w, r, state, http.MethodGet, apiPrefix+"/api/v1/model-options?language=zh-CN", nil)
-	})
-	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
-		state, err := loadState(statePath, sessionKey)
-		if err != nil {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "auth state unavailable"})
-			return
-		}
-		body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid body"})
-			return
-		}
-		var req chatRequest
-		if err := json.Unmarshal(body, &req); err != nil || req.Model == "" || len(req.Messages) == 0 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "model and messages are required"})
-			return
-		}
-		upstreamBody, err := buildUpstreamBody(req)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid messages"})
-			return
-		}
-		proxyChat(w, r, state, upstreamBody, req.Stream || acceptsSSE(r))
-	})
+	registerAPI(mux, func() (authState, error) { return loadState(statePath, sessionKey) })
 	server := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	fmt.Fprintf(os.Stderr, "teleagent2api listening on http://%s\n", addr)
 	return server.ListenAndServe()
@@ -299,18 +271,6 @@ func normalizeContent(raw json.RawMessage) (any, error) {
 	return nil, errors.New("unsupported content")
 }
 
-func proxyJSON(w http.ResponseWriter, r *http.Request, state authState, method, path string, body []byte) {
-	resp, err := signedRequest(r, state, method, path, body)
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "upstream unavailable"})
-		return
-	}
-	defer resp.Body.Close()
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
-}
-
 func proxyChat(w http.ResponseWriter, r *http.Request, state authState, body []byte, stream bool) {
 	resp, err := signedRequest(r, state, http.MethodPost, chatPath, body)
 	if err != nil {
@@ -318,10 +278,19 @@ func proxyChat(w http.ResponseWriter, r *http.Request, state authState, body []b
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || !stream {
+	if resp.StatusCode != http.StatusOK {
 		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
+		return
+	}
+	if !stream {
+		result, err := readCompletion(resp.Body, nil)
+		if err != nil {
+			writeAPIError(w, chatAPI, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, result.chatJSON())
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -438,41 +407,8 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
-type sseScanner struct {
-	r    io.Reader
-	buf  []byte
-	line string
-	err  error
-}
-
-func newSSEScanner(r io.Reader) *sseScanner { return &sseScanner{r: r, buf: make([]byte, 0, 4096)} }
-
-func (s *sseScanner) Scan() bool {
-	for {
-		if i := bytes.IndexByte(s.buf, '\n'); i >= 0 {
-			s.line = strings.TrimRight(string(s.buf[:i]), "\r")
-			s.buf = s.buf[i+1:]
-			return true
-		}
-		tmp := make([]byte, 4096)
-		n, err := s.r.Read(tmp)
-		s.buf = append(s.buf, tmp[:n]...)
-		if err != nil {
-			if len(s.buf) > 0 && errors.Is(err, io.EOF) {
-				s.line = string(s.buf)
-				s.buf = nil
-				return true
-			}
-			s.err = err
-			return false
-		}
-	}
-}
-
-func (s *sseScanner) Text() string { return s.line }
-func (s *sseScanner) Err() error {
-	if errors.Is(s.err, io.EOF) {
-		return nil
-	}
-	return s.err
+func newSSEScanner(r io.Reader) *bufio.Scanner {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 4096), 8<<20)
+	return scanner
 }

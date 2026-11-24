@@ -1,6 +1,6 @@
 # teleagent2api
 
-把本机已经登录的 TeleAgent 3.0.0-rc.1 转成只监听本机的 OpenAI 兼容网关。
+把本机已经登录的 TeleAgent 3.0.0-rc.1 转成只监听本机的 OpenAI 和 Anthropic 兼容网关。
 
 它不实现天翼账号登录，也不接收手机号或验证码。程序只读取当前平台上 TeleAgent 已保存的登录状态，并代发官方模型请求。
 
@@ -11,8 +11,6 @@
 | Linux / WSL | 可以。读取 `local-key` 与 `token.json` | `/health`、模型列表、流式对话、三个模型、工具调用及工具结果回传通过 |
 | Windows | 可以。`scheme=safe_storage` 用当前用户的 DPAPI 解开 `Local State` 里的 `os_crypt` 密钥，再解 `v10` 密文 | 用本机 Windows 登录态签名后，`user_info`、模型目录和 `chat-flash` 流式对话返回 HTTP 200 |
 | 网页 | 桌面 `token.json` 不存在或已过期时，读取 TeleAgent 与 Chrome / Edge 里的 `operationToken` 或 `x-token` | 桌面程序里的这枚 Cookie 与桌面 JWT 是同一枚。浏览器里过期的 Cookie 不会拿来签名 |
-
-`stream:false` 当前仍透传上游 SSE，不会聚合成单个 JSON。
 
 ## 运行
 
@@ -76,8 +74,12 @@ TELEAGENT_SESSION_KEY='本机会话密钥' \
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | 网关存活 |
-| GET | `/v1/models` | 转发模型目录 |
-| POST | `/v1/chat/completions` | OpenAI 兼容对话 |
+| GET | `/v1/models` | OpenAI 模型目录。带 `anthropic-version` 请求头时返回 Anthropic 模型目录 |
+| GET | `/v1/models?format=codex` | Codex 可加载的模型目录 |
+| POST | `/v1/chat/completions` | OpenAI Chat Completions |
+| POST | `/v1/responses` | OpenAI Responses |
+| POST | `/v1/messages` | Anthropic Messages |
+| POST | `/v1/messages/count_tokens` | 估算 Anthropic 请求的输入 token 数 |
 
 对话示例：
 
@@ -88,6 +90,38 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 ```
 
 支持 `messages`、文本数组、`tools`、`tool_choice`、`tool_calls` 和工具结果回传。`chat-pro` 实测不支持温度、推理和附件，但支持工具调用。可用模型为 `chat-pro`、`chat-flagship`、`chat-flash`。
+
+三种对话入口均支持 JSON 和 SSE 响应，以及客户端工具定义、调用参数和结果回传。Responses 请求需在 `input` 中带上本轮所需的完整历史。令牌估算用于 Claude Code 的上下文管理，实际用量来自上游。
+
+## Claude Code
+
+网关启动后，在希望使用 Claude Code 的目录运行：
+
+```bash
+claude --settings '{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8787","ANTHROPIC_AUTH_TOKEN":"local","CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1"}}' \
+  --model teleagent-anthropic/chat-pro
+```
+
+`/model` 会从网关发现模型。Anthropic 目录为模型加上 `teleagent-anthropic/` 前缀，以匹配 Claude Code 的发现规则。网关把这些 ID 映射到原始 TeleAgent 模型。也可以直接用 `--model chat-pro`。[`/model` 发现规则](https://code.claude.com/docs/en/llm-gateway-protocol#model-discovery)
+
+## Codex
+
+获取模型目录，并在启动时将它交给 Codex 的 `model_catalog_json`。[Codex 配置参考](https://learn.chatgpt.com/docs/config-file/config-reference)
+
+```bash
+catalog="$HOME/.codex/teleagent-models.json"
+mkdir -p "$(dirname "$catalog")"
+curl -fsS 'http://127.0.0.1:8787/v1/models?format=codex' -o "$catalog" &&
+  TELEAGENT_API_KEY=local codex -m chat-pro \
+    -c "model_catalog_json=\"$catalog\"" \
+    -c 'model_provider="teleagent"' \
+    -c 'model_providers.teleagent.name="TeleAgent"' \
+    -c 'model_providers.teleagent.base_url="http://127.0.0.1:8787/v1"' \
+    -c 'model_providers.teleagent.wire_api="responses"' \
+    -c 'model_providers.teleagent.env_key="TELEAGENT_API_KEY"'
+```
+
+Claude Code 和 Codex 示例中的 `local` 是客户端占位值。上游认证由网关读取本机 TeleAgent 登录态完成。
 
 ## 上游
 
@@ -103,7 +137,7 @@ Content-Type: application/json
 GET /superCowork/sapi/api/v1/model-options?language=zh-CN
 ```
 
-成功响应是 SSE。网关转发 `data:` 行，保留 `[DONE]`，忽略空行和注释。增量字段包括 `delta.content`、`delta.reasoning_content`、按 index 合并的 `tool_calls`，以及 `usage`。
+上游成功响应是 SSE。Chat Completions 流式请求直接转发 `data:` 和 `[DONE]`。其他请求由网关读取 SSE，按索引合并工具调用增量，并生成对应协议的事件或 JSON。
 
 ## 安全边界
 
